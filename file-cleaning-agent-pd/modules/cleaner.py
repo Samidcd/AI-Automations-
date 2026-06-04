@@ -1,108 +1,293 @@
-"""Hard cleaning rules for File Cleaning Agent PD."""
+"""
+Hard cleaning rules for File Cleaning Agent PD.
+
+Pipeline (applied in order):
+  1. Strip hidden chars (\n \r \t), collapse whitespace
+  2. Remove emojis & symbol characters
+  3. Remove honorific prefixes (Dr., Ing., MUDr., etc.)
+  4. Remove parentheticals  e.g. Archana (Arch) → Archana
+  5. Remove middle initials  e.g. Amy H. → Amy
+  6. Remove trailing punctuation dots
+  7. Fix casing (all-caps / all-lower / hyphenated segments)
+  8. Multi-word first-name resolution via LinkedIn slug
+  9. First/Last swap detection via LinkedIn slug
+ 10. Junk-row detection (company accounts, non-Latin, single-letter)
+"""
 
 import re
 import unicodedata
 import pandas as pd
 
-# ── Titles and credentials to strip ──────────────────────────────────────────
 
-TITLES = {
-    "dr", "dr.", "prof", "prof.", "mr", "mr.", "mrs", "mrs.", "ms", "ms.",
-    "miss", "rev", "rev.", "sir", "lord", "lady", "hon", "hon.",
-    "eng", "eng.", "capt", "capt.", "col", "col.", "gen", "gen.",
-    "lt", "lt.", "sgt", "sgt.", "cpl", "cpl.",
-}
+# ── Emoji & symbol removal ────────────────────────────────────────────────────
 
-CREDENTIALS = {
-    "md", "phd", "ph.d", "ph.d.", "mba", "msc", "ms", "ma", "ba", "bs",
-    "do", "dds", "dvm", "jd", "rn", "np", "pa", "cnp", "cpa", "cfa",
-    "pe", "pmp", "cissp", "ceo", "cto", "coo", "cfo", "cmo",
-    "esq", "esq.", "ii", "iii", "iv", "jr", "jr.", "sr", "sr.",
-}
-
-# Characters that should never appear in a name field
-_NAME_JUNK_RE = re.compile(
-    r'[!@#$%^&*()+=\[\]{};\'\\|<>?/~`"]'  # special chars
-    r'|(?<!\w)og(?!\w)'                    # standalone "og"
-    r'|(?<!\w)OG(?!\w)',                   # standalone "OG"
-    re.IGNORECASE,
-)
-
-# Emoji pattern
 _EMOJI_RE = re.compile(
     "["
-    "\U0001F600-\U0001F64F"
-    "\U0001F300-\U0001F5FF"
-    "\U0001F680-\U0001F9FF"
-    "\U00002600-\U000027BF"
-    "\U0001FA00-\U0001FA6F"
-    "\U0001FA70-\U0001FAFF"
-    "\U00002702-\U000027B0"
+    "\U0001F000-\U0001FFFF"   # Emoticons, pictographs, transport, misc symbols
+    "\U00002600-\U000027BF"   # Misc symbols (★☆♠♣…)
+    "\U0000FE00-\U0000FE0F"   # Variation selectors
+    "\U00020000-\U0010FFFF"   # Supplementary CJK, tags, etc.
     "]+",
     flags=re.UNICODE,
 )
 
 
 def _strip_emojis(text: str) -> str:
-    return _EMOJI_RE.sub("", text).strip()
+    return _EMOJI_RE.sub("", text)
 
 
-def _remove_junk_chars(text: str) -> str:
-    """Remove special characters that don't belong in name fields."""
-    return _NAME_JUNK_RE.sub("", text).strip()
+# ── Hidden / control character removal ───────────────────────────────────────
+
+def _strip_hidden(text: str) -> str:
+    """Replace \n \r \t and other control chars with a space, then collapse."""
+    text = re.sub(r"[\r\n\t\x0B\x0C\x00-\x1F\x7F]", " ", text)
+    text = re.sub(r" {2,}", " ", text)
+    return text.strip()
 
 
-def _title_case(text: str) -> str:
-    return text.title()
+# ── Honorific prefixes ────────────────────────────────────────────────────────
+
+_HONORIFIC_RE = re.compile(
+    r"^("
+    r"Dr\.?\s+rer\.?\s+nat\.?"   # Dr. rer. nat.
+    r"|MUDr\.?"                   # Czech/Slovak medical degree prefix
+    r"|PhDr\.?"                   # Czech humanties doctoral prefix
+    r"|Ing\.?"                    # Engineer prefix (European)
+    r"|Prof\.?"                   # Professor
+    r"|Dr\.?"                     # Doctor
+    r"|Mr\.?"                     # Mister
+    r"|Mrs\.?"                    # Missus
+    r"|Ms\.?"                     # Miss / Ms
+    r"|Rev\.?"                    # Reverend
+    r"|Sir"
+    r"|Lord"
+    r"|Lady"
+    r"|Hon\.?"                    # Honorable
+    r"|Capt\.?"                   # Captain
+    r"|Col\.?"                    # Colonel
+    r"|Gen\.?"                    # General
+    r"|Lt\.?"                     # Lieutenant
+    r"|Sgt\.?"                    # Sergeant
+    r")\s+",
+    re.IGNORECASE,
+)
+
+
+def _strip_honorifics(text: str) -> str:
+    """Remove leading title prefixes, repeatedly (handles 'Dr. Prof. Name')."""
+    prev = None
+    while prev != text:
+        prev = text
+        text = _HONORIFIC_RE.sub("", text, count=1).strip()
+    return text
+
+
+# ── Credential / suffix removal ───────────────────────────────────────────────
+
+_CREDENTIAL_SUFFIX_RE = re.compile(
+    r"[,\s]+"
+    r"("
+    r"M\.?D\.?"
+    r"|Ph\.?D\.?"
+    r"|M\.?B\.?A\.?"
+    r"|M\.?Sc\.?"
+    r"|B\.?Sc\.?"
+    r"|B\.?A\.?"
+    r"|D\.?O\.?"
+    r"|D\.?D\.?S\.?"
+    r"|D\.?V\.?M\.?"
+    r"|J\.?D\.?"
+    r"|R\.?N\.?"
+    r"|N\.?P\.?"
+    r"|C\.?P\.?A\.?"
+    r"|C\.?F\.?A\.?"
+    r"|P\.?M\.?P\.?"
+    r"|Esq\.?"
+    r"|Jr\.?"
+    r"|Sr\.?"
+    r"|I{2,3}V?"        # II, III, IV
+    r"|OG"
+    r")"
+    r"(?:[,\s].*)?$",   # drop everything after the credential too
+    re.IGNORECASE,
+)
+
+
+def _strip_credential_suffixes(text: str) -> str:
+    return _CREDENTIAL_SUFFIX_RE.sub("", text).strip()
+
+
+# ── Parenthetical removal  e.g. "Jean Francois (JF)" → "Jean Francois" ───────
+
+_PAREN_RE = re.compile(r"\s*\(.*?\)\s*")
+
+
+def _strip_parentheticals(text: str) -> str:
+    return _PAREN_RE.sub(" ", text).strip()
+
+
+# ── Middle initial removal  e.g. "Amy H." → "Amy" (for first-name field) ─────
+
+_MIDDLE_INITIAL_RE = re.compile(r"\s+[A-Z]\.$")
+
+
+def _strip_middle_initial(text: str) -> str:
+    return _MIDDLE_INITIAL_RE.sub("", text).strip()
+
+
+# ── Trailing / leading punctuation ────────────────────────────────────────────
+
+def _strip_edge_punct(text: str) -> str:
+    return text.strip(".,;:!?\"'`-")
+
+
+# ── Casing ────────────────────────────────────────────────────────────────────
+
+def _smart_case(text: str) -> str:
+    """
+    Title-case a name, respecting:
+    - Hyphenated segments: Jean-Marc → Jean-Marc
+    - All-caps tokens: VIRGINIA → Virginia
+    - All-lower tokens: virginia → Virginia
+    - Short particles left lower (de, van, von, da, dos) when mid-name
+    """
+    PARTICLES = {"de", "van", "von", "da", "dos", "del", "della", "le", "la", "les", "el", "al"}
+
+    def cap_segment(s: str) -> str:
+        # Handle hyphenated compound segments
+        parts = s.split("-")
+        return "-".join(p.capitalize() for p in parts if p)
+
+    tokens = text.split()
+    result = []
+    for i, tok in enumerate(tokens):
+        lower = tok.lower()
+        if i > 0 and lower in PARTICLES:
+            result.append(lower)
+        else:
+            result.append(cap_segment(tok))
+    return " ".join(result)
+
+
+# ── LinkedIn slug helpers ─────────────────────────────────────────────────────
+
+def _slug_from_linkedin(url) -> str | None:
+    """Extract the profile slug from a LinkedIn URL, e.g. 'jean-francois-martin'."""
+    if pd.isna(url) or not str(url).strip():
+        return None
+    m = re.search(r"linkedin\.com/in/([^/?#]+)", str(url), re.IGNORECASE)
+    if not m:
+        return None
+    return m.group(1).lower().strip("/")
+
+
+def _slug_tokens(slug: str) -> list[str]:
+    """Split slug on hyphens, strip numeric suffixes like '-ab1234'."""
+    parts = slug.split("-")
+    # Drop trailing parts that look like random IDs (short alphanum)
+    cleaned = [p for p in parts if p and not re.fullmatch(r"[a-z]{1,2}\d+", p)]
+    return cleaned
+
+
+# ── Junk-row detection ────────────────────────────────────────────────────────
+
+# Unicode script ranges for non-Latin scripts
+_NON_LATIN_RE = re.compile(
+    r"[Ѐ-ӿ"   # Cyrillic
+    r"一-鿿"    # CJK Unified
+    r"぀-ヿ"    # Hiragana / Katakana
+    r"가-힯"    # Korean Hangul
+    r"؀-ۿ"    # Arabic
+    r"ऀ-ॿ"    # Devanagari
+    r"]",
+)
+
+
+def is_junk_name(first: str, last: str) -> bool:
+    """Return True if this row looks like a company account or garbage."""
+    full = f"{first} {last}".strip()
+    if not full:
+        return False
+    # Single-character name
+    if len(full.replace(" ", "")) <= 1:
+        return True
+    # Non-Latin script
+    if _NON_LATIN_RE.search(full):
+        return True
+    # Looks like a company (contains Inc, LLC, Ltd, Corp, &, @, digits)
+    if re.search(r"\b(Inc\.?|LLC|Ltd\.?|Corp\.?|GmbH|S\.A\.?)\b", full, re.IGNORECASE):
+        return True
+    if re.search(r"[@&]|\d{3,}", full):
+        return True
+    return False
+
+
+# ── Core name cleaner ─────────────────────────────────────────────────────────
+
+def _base_name_clean(val) -> str:
+    """Apply the shared pipeline steps to any name value."""
+    if pd.isna(val) or str(val).strip() == "":
+        return ""
+    text = str(val)
+    text = _strip_hidden(text)
+    text = _strip_emojis(text)
+    text = _strip_parentheticals(text)
+    text = _strip_honorifics(text)
+    text = _strip_credential_suffixes(text)
+    text = _strip_edge_punct(text)
+    # Remove junk special chars (but keep hyphens and apostrophes for names)
+    text = re.sub(r'[!@#$%^&*()+=\[\]{};\\|<>?/~`\"]', "", text)
+    text = re.sub(r" {2,}", " ", text).strip()
+    return text
 
 
 # ── First name ────────────────────────────────────────────────────────────────
 
-def clean_first_name(val) -> str:
-    if pd.isna(val) or str(val).strip() == "":
+def clean_first_name(val, linkedin_url=None) -> str:
+    text = _base_name_clean(val)
+    if not text:
         return ""
-    text = str(val).strip()
-    text = _strip_emojis(text)
-    text = _remove_junk_chars(text)
 
-    # Split on whitespace/comma; take first non-title token
-    tokens = re.split(r"[\s,]+", text)
-    result_tokens = []
-    for tok in tokens:
-        tok_clean = tok.strip(".,")
-        if tok_clean.lower() in TITLES:
-            continue  # drop title prefix
-        if tok_clean.lower() in CREDENTIALS:
-            break  # stop at credential suffix
-        result_tokens.append(tok_clean)
-        break  # only first name token
+    # Remove middle initial (only relevant for first-name field)
+    text = _strip_middle_initial(text)
 
-    result = result_tokens[0] if result_tokens else ""
-    return _title_case(result)
+    tokens = text.split()
+
+    # Multi-word first name: use LinkedIn slug to decide how many words belong
+    if len(tokens) >= 2 and linkedin_url:
+        slug = _slug_from_linkedin(linkedin_url)
+        if slug:
+            slug_toks = _slug_tokens(slug)
+            # Count how many leading tokens of 'text' match slug tokens
+            match_count = 0
+            for tok in tokens:
+                if match_count < len(slug_toks) and tok.lower() == slug_toks[match_count]:
+                    match_count += 1
+                else:
+                    break
+            # If slug starts with first token only, keep just first token
+            if match_count == 1:
+                tokens = tokens[:1]
+            # If slug confirms 2+ tokens as first name (e.g. 'maria-del-mar'), keep them
+            elif match_count >= 2 and match_count <= 3:
+                tokens = tokens[:match_count]
+            else:
+                tokens = tokens[:1]
+        else:
+            # No LinkedIn — conservatively keep only the first token
+            tokens = tokens[:1]
+
+    result = " ".join(tokens)
+    return _smart_case(result)
 
 
 # ── Last name ─────────────────────────────────────────────────────────────────
 
 def clean_last_name(val) -> str:
-    if pd.isna(val) or str(val).strip() == "":
+    text = _base_name_clean(val)
+    if not text:
         return ""
-    text = str(val).strip()
-    text = _strip_emojis(text)
-    text = _remove_junk_chars(text)
-
-    # Remove credential suffixes separated by comma or space
-    tokens = re.split(r"[\s,]+", text)
-    result_tokens = []
-    for tok in tokens:
-        tok_clean = tok.strip(".,")
-        if tok_clean.lower() in CREDENTIALS:
-            break
-        if tok_clean.lower() in TITLES:
-            continue
-        result_tokens.append(tok_clean)
-
-    result = " ".join(result_tokens).strip()
-    return _title_case(result)
+    return _smart_case(text)
 
 
 # ── Job title ─────────────────────────────────────────────────────────────────
@@ -110,11 +295,11 @@ def clean_last_name(val) -> str:
 def clean_job_title(val) -> str:
     if pd.isna(val) or str(val).strip() == "":
         return ""
-    text = str(val).strip()
+    text = str(val)
+    text = _strip_hidden(text)
     text = _strip_emojis(text)
-    # Remove non-printable/control chars but keep standard punctuation
+    # Remove non-printable control chars
     text = "".join(ch for ch in text if unicodedata.category(ch)[0] != "C")
-    # Collapse multiple spaces
     text = re.sub(r" {2,}", " ", text).strip()
     return text
 
@@ -127,27 +312,21 @@ def clean_linkedin_url(val) -> str:
     url = str(val).strip()
     if not url.startswith("http"):
         url = "https://" + url
-    url = re.sub(r"\?.*$", "", url)  # strip tracking params
+    url = re.sub(r"\?.*$", "", url)   # strip tracking params
     return url.rstrip("/")
 
 
 # ── Company name ──────────────────────────────────────────────────────────────
 
-_COMPANY_JUNK_RE = re.compile(
-    r'[!@#$%^&*()+=\[\]{};\'\\|<>?/~`"]'
-    r'|\s{2,}'
-)
-
 def clean_company_name(val) -> str:
     if pd.isna(val) or str(val).strip() == "":
         return ""
-    text = str(val).strip()
+    text = str(val)
+    text = _strip_hidden(text)
     text = _strip_emojis(text)
-    # Remove junk chars but preserve hyphens that are part of names (e.g. Coca-Cola)
-    # Strip leading/trailing hyphens and doubled hyphens
-    text = re.sub(r"[!@#$%^&*()+=\[\]{};\'\\|<>?/~`\"]", "", text)
-    text = re.sub(r"-{2,}", "-", text)   # double hyphens → single
-    text = re.sub(r"(^-+|-+$)", "", text)  # leading/trailing hyphens
+    text = re.sub(r'[!@#$%^&*()+=\[\]{};\'\\|<>?/~`\"]', "", text)
+    text = re.sub(r"-{2,}", "-", text)        # double hyphens → single
+    text = re.sub(r"(^-+|-+$)", "", text)     # leading/trailing hyphens
     text = "".join(ch for ch in text if unicodedata.category(ch)[0] != "C")
     text = re.sub(r" {2,}", " ", text).strip()
     return text
@@ -156,17 +335,17 @@ def clean_company_name(val) -> str:
 # ── Location → Country ────────────────────────────────────────────────────────
 
 US_STATES = {
-    "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
-    "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
-    "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana",
-    "maine", "maryland", "massachusetts", "michigan", "minnesota",
-    "mississippi", "missouri", "montana", "nebraska", "nevada",
-    "new hampshire", "new jersey", "new mexico", "new york",
-    "north carolina", "north dakota", "ohio", "oklahoma", "oregon",
-    "pennsylvania", "rhode island", "south carolina", "south dakota",
-    "tennessee", "texas", "utah", "vermont", "virginia", "washington",
-    "west virginia", "wisconsin", "wyoming", "district of columbia",
-    "dc", "d.c.",
+    "alabama","alaska","arizona","arkansas","california","colorado",
+    "connecticut","delaware","florida","georgia","hawaii","idaho",
+    "illinois","indiana","iowa","kansas","kentucky","louisiana",
+    "maine","maryland","massachusetts","michigan","minnesota",
+    "mississippi","missouri","montana","nebraska","nevada",
+    "new hampshire","new jersey","new mexico","new york",
+    "north carolina","north dakota","ohio","oklahoma","oregon",
+    "pennsylvania","rhode island","south carolina","south dakota",
+    "tennessee","texas","utah","vermont","virginia","washington",
+    "west virginia","wisconsin","wyoming","district of columbia",
+    "dc","d.c.",
 }
 
 US_STATE_ABBREVS = {
@@ -176,226 +355,118 @@ US_STATE_ABBREVS = {
     "tx","ut","vt","va","wa","wv","wi","wy","dc",
 }
 
-# Map common country name variants to standardized names
 COUNTRY_ALIASES: dict[str, str] = {
-    "united states": "United States",
-    "united states of america": "United States",
-    "usa": "United States",
-    "u.s.a.": "United States",
-    "u.s.": "United States",
-    "us": "United States",
-    "uk": "United Kingdom",
-    "united kingdom": "United Kingdom",
-    "great britain": "United Kingdom",
-    "england": "United Kingdom",
-    "scotland": "United Kingdom",
-    "wales": "United Kingdom",
-    "northern ireland": "United Kingdom",
-    "uae": "United Arab Emirates",
-    "u.a.e.": "United Arab Emirates",
-    "united arab emirates": "United Arab Emirates",
-    "south korea": "South Korea",
-    "republic of korea": "South Korea",
-    "korea": "South Korea",
-    "north korea": "North Korea",
-    "dprk": "North Korea",
-    "czech republic": "Czech Republic",
-    "czechia": "Czech Republic",
-    "taiwan": "Taiwan",
-    "hong kong": "Hong Kong",
-    "singapore": "Singapore",
-    "canada": "Canada",
-    "australia": "Australia",
-    "new zealand": "New Zealand",
-    "germany": "Germany",
-    "deutschland": "Germany",
-    "france": "France",
-    "spain": "Spain",
-    "españa": "Spain",
-    "italy": "Italy",
-    "italia": "Italy",
-    "netherlands": "Netherlands",
-    "the netherlands": "Netherlands",
-    "holland": "Netherlands",
-    "switzerland": "Switzerland",
-    "sweden": "Sweden",
-    "norway": "Norway",
-    "denmark": "Denmark",
-    "finland": "Finland",
-    "belgium": "Belgium",
-    "austria": "Austria",
-    "portugal": "Portugal",
-    "poland": "Poland",
-    "brazil": "Brazil",
-    "brasil": "Brazil",
-    "mexico": "Mexico",
-    "méxico": "Mexico",
-    "argentina": "Argentina",
-    "chile": "Chile",
-    "colombia": "Colombia",
-    "peru": "Peru",
-    "india": "India",
-    "china": "China",
-    "japan": "Japan",
-    "indonesia": "Indonesia",
-    "malaysia": "Malaysia",
-    "philippines": "Philippines",
-    "thailand": "Thailand",
-    "vietnam": "Vietnam",
-    "pakistan": "Pakistan",
-    "bangladesh": "Bangladesh",
-    "nigeria": "Nigeria",
-    "south africa": "South Africa",
-    "kenya": "Kenya",
-    "ghana": "Ghana",
-    "egypt": "Egypt",
-    "israel": "Israel",
-    "turkey": "Turkey",
-    "türkiye": "Turkey",
-    "russia": "Russia",
-    "ukraine": "Ukraine",
-    "poland": "Poland",
-    "romania": "Romania",
-    "greece": "Greece",
-    "hungary": "Hungary",
-    "ireland": "Ireland",
-    "croatia": "Croatia",
-    "serbia": "Serbia",
-    "slovakia": "Slovakia",
-    "bulgaria": "Bulgaria",
-    "slovenia": "Slovenia",
-    "luxembourg": "Luxembourg",
-    "malta": "Malta",
-    "cyprus": "Cyprus",
-    "estonia": "Estonia",
-    "latvia": "Latvia",
-    "lithuania": "Lithuania",
-    "saudi arabia": "Saudi Arabia",
-    "ksa": "Saudi Arabia",
-    "qatar": "Qatar",
-    "kuwait": "Kuwait",
-    "bahrain": "Bahrain",
-    "oman": "Oman",
-    "jordan": "Jordan",
-    "lebanon": "Lebanon",
-    "iraq": "Iraq",
-    "iran": "Iran",
-    "morocco": "Morocco",
-    "algeria": "Algeria",
-    "tunisia": "Tunisia",
-    "ethiopia": "Ethiopia",
-    "tanzania": "Tanzania",
-    "uganda": "Uganda",
-    "zimbabwe": "Zimbabwe",
-    "new caledonia": "New Caledonia",
-    "puerto rico": "Puerto Rico",
-    "remote": "Remote",
-    "worldwide": "Worldwide",
-    "global": "Global",
+    "united states":"United States","united states of america":"United States",
+    "usa":"United States","u.s.a.":"United States","u.s.":"United States","us":"United States",
+    "uk":"United Kingdom","united kingdom":"United Kingdom","great britain":"United Kingdom",
+    "england":"United Kingdom","scotland":"United Kingdom","wales":"United Kingdom",
+    "northern ireland":"United Kingdom",
+    "uae":"United Arab Emirates","u.a.e.":"United Arab Emirates","united arab emirates":"United Arab Emirates",
+    "south korea":"South Korea","republic of korea":"South Korea","korea":"South Korea",
+    "north korea":"North Korea","dprk":"North Korea",
+    "czech republic":"Czech Republic","czechia":"Czech Republic",
+    "taiwan":"Taiwan","hong kong":"Hong Kong","singapore":"Singapore",
+    "canada":"Canada","australia":"Australia","new zealand":"New Zealand",
+    "germany":"Germany","deutschland":"Germany",
+    "france":"France","spain":"Spain","españa":"Spain",
+    "italy":"Italy","italia":"Italy",
+    "netherlands":"Netherlands","the netherlands":"Netherlands","holland":"Netherlands",
+    "switzerland":"Switzerland","sweden":"Sweden","norway":"Norway",
+    "denmark":"Denmark","finland":"Finland","belgium":"Belgium",
+    "austria":"Austria","portugal":"Portugal","poland":"Poland",
+    "brazil":"Brazil","brasil":"Brazil",
+    "mexico":"Mexico","méxico":"Mexico",
+    "argentina":"Argentina","chile":"Chile","colombia":"Colombia","peru":"Peru",
+    "india":"India","china":"China","japan":"Japan","indonesia":"Indonesia",
+    "malaysia":"Malaysia","philippines":"Philippines","thailand":"Thailand",
+    "vietnam":"Vietnam","pakistan":"Pakistan","bangladesh":"Bangladesh",
+    "nigeria":"Nigeria","south africa":"South Africa","kenya":"Kenya",
+    "ghana":"Ghana","egypt":"Egypt","israel":"Israel",
+    "turkey":"Turkey","türkiye":"Turkey",
+    "russia":"Russia","ukraine":"Ukraine","romania":"Romania",
+    "greece":"Greece","hungary":"Hungary","ireland":"Ireland",
+    "croatia":"Croatia","serbia":"Serbia","slovakia":"Slovakia",
+    "bulgaria":"Bulgaria","slovenia":"Slovenia","luxembourg":"Luxembourg",
+    "malta":"Malta","cyprus":"Cyprus","estonia":"Estonia",
+    "latvia":"Latvia","lithuania":"Lithuania",
+    "saudi arabia":"Saudi Arabia","ksa":"Saudi Arabia",
+    "qatar":"Qatar","kuwait":"Kuwait","bahrain":"Bahrain","oman":"Oman",
+    "jordan":"Jordan","lebanon":"Lebanon","iraq":"Iraq","iran":"Iran",
+    "morocco":"Morocco","algeria":"Algeria","tunisia":"Tunisia",
+    "ethiopia":"Ethiopia","tanzania":"Tanzania","uganda":"Uganda","zimbabwe":"Zimbabwe",
+    "remote":"Remote","worldwide":"Worldwide","global":"Global",
 }
 
 
 def clean_location(val) -> str:
-    """
-    Standardize location to country level.
-    'Boston, Massachusetts' → 'United States'
-    'London, UK' → 'United Kingdom'
-    """
     if pd.isna(val) or str(val).strip() == "":
         return ""
+    text = _strip_hidden(str(val))
+    text = _strip_emojis(text)
 
-    raw = str(val).strip()
-    text = _strip_emojis(raw)
-    text = re.sub(r"\s{2,}", " ", text).strip()
-
-    # Split on comma — last part is often the country/state
     parts = [p.strip() for p in text.split(",")]
 
-    # Check each part from right to left
+    # Check parts right-to-left (country/state usually last)
     for part in reversed(parts):
-        key = part.strip().lower().strip(".")
-        # Direct country alias match
+        key = part.lower().strip(".")
         if key in COUNTRY_ALIASES:
             return COUNTRY_ALIASES[key]
-        # US state name
         if key in US_STATES:
             return "United States"
-        # US state abbreviation (only if short)
         if len(key) == 2 and key in US_STATE_ABBREVS:
             return "United States"
 
-    # Try whole string as a country alias
+    # Try whole string
     key = text.lower().strip(".")
     if key in COUNTRY_ALIASES:
         return COUNTRY_ALIASES[key]
     if key in US_STATES:
         return "United States"
 
-    # Try pycountry as fallback
+    # pycountry fuzzy fallback
     try:
         import pycountry
         for part in reversed(parts):
-            result = pycountry.countries.get(name=part.strip())
+            p = part.strip()
+            result = pycountry.countries.get(name=p)
             if result:
                 return result.name
-            # fuzzy search
-            results = pycountry.countries.search_fuzzy(part.strip())
-            if results:
-                return results[0].name
+            try:
+                results = pycountry.countries.search_fuzzy(p)
+                if results:
+                    return results[0].name
+            except LookupError:
+                pass
     except Exception:
         pass
 
-    # Return cleaned original if we can't resolve
-    return text
+    return text  # return cleaned original if unresolvable
 
 
-# ── Column detection ──────────────────────────────────────────────────────────
+# ── Column name normalisation ─────────────────────────────────────────────────
 
-# Maps common raw column name variations to our canonical names
 COLUMN_MAP = {
-    # first name
-    "first name": "first_name",
-    "firstname": "first_name",
-    "first_name": "first_name",
-    "given name": "first_name",
-    # last name
-    "last name": "last_name",
-    "lastname": "last_name",
-    "last_name": "last_name",
-    "surname": "last_name",
-    "family name": "last_name",
-    # job title
-    "job title": "job_title",
-    "jobtitle": "job_title",
-    "job_title": "job_title",
-    "title": "job_title",
-    "position": "job_title",
-    "role": "job_title",
-    # linkedin
-    "linkedin": "linkedin_url",
-    "linkedin url": "linkedin_url",
-    "linkedin_url": "linkedin_url",
-    "linkedin profile": "linkedin_url",
-    "profile url": "linkedin_url",
-    # company
-    "company": "company",
-    "company name": "company",
-    "organization": "company",
-    "organisation": "company",
-    "employer": "company",
-    # location / country
-    "location": "location",
-    "country": "location",
-    "country/region": "location",
-    "region": "location",
-    "city": "location",
-    "city, state": "location",
-    "city/state": "location",
+    "first name":"first_name","firstname":"first_name","first_name":"first_name","given name":"first_name",
+    "last name":"last_name","lastname":"last_name","last_name":"last_name","surname":"last_name","family name":"last_name",
+    "job title":"job_title","jobtitle":"job_title","job_title":"job_title","title":"job_title","position":"job_title","role":"job_title",
+    "linkedin":"linkedin_url","linkedin url":"linkedin_url","linkedin_url":"linkedin_url",
+    "linkedin profile":"linkedin_url","profile url":"linkedin_url",
+    "company":"company","company name":"company","organization":"company","organisation":"company","employer":"company",
+    "location":"location","country":"location","country/region":"location","region":"location",
+    "city":"location","city, state":"location","city/state":"location","city, country":"location",
+}
+
+FIELD_CLEANERS = {
+    "first_name":  None,   # handled specially (needs linkedin_url)
+    "last_name":   clean_last_name,
+    "job_title":   clean_job_title,
+    "linkedin_url": clean_linkedin_url,
+    "company":     clean_company_name,
+    "location":    clean_location,
 }
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename columns to canonical names based on COLUMN_MAP."""
     rename = {}
     for col in df.columns:
         key = col.strip().lower()
@@ -406,33 +477,43 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── Master clean function ─────────────────────────────────────────────────────
 
-FIELD_CLEANERS = {
-    "first_name": clean_first_name,
-    "last_name": clean_last_name,
-    "job_title": clean_job_title,
-    "linkedin_url": clean_linkedin_url,
-    "company": clean_company_name,
-    "location": clean_location,
-}
-
-
 def clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
     """
     Apply all hard cleaning rules to recognized columns.
-    Returns (cleaned_df, change_counts) where change_counts maps column → number of cells changed.
+    Returns (cleaned_df, change_counts).
     """
     df = normalize_columns(df.copy())
     change_counts: dict[str, int] = {}
 
+    # First pass: clean linkedin_url (needed for first_name resolution)
+    if "linkedin_url" in df.columns:
+        orig = df["linkedin_url"].fillna("").astype(str)
+        df["linkedin_url"] = df["linkedin_url"].apply(clean_linkedin_url)
+        change_counts["linkedin_url"] = int((df["linkedin_url"].fillna("").astype(str) != orig).sum())
+
+    # Clean first_name (pass linkedin_url for slug resolution)
+    if "first_name" in df.columns:
+        orig = df["first_name"].fillna("").astype(str)
+        linkedin_series = df.get("linkedin_url", pd.Series([""] * len(df)))
+        df["first_name"] = [
+            clean_first_name(fn, li)
+            for fn, li in zip(df["first_name"], linkedin_series)
+        ]
+        change_counts["first_name"] = int((df["first_name"].fillna("").astype(str) != orig).sum())
+
+    # Clean remaining fields
     for col, fn in FIELD_CLEANERS.items():
-        if col not in df.columns:
+        if fn is None or col not in df.columns:
             continue
-        original = df[col].copy()
+        orig = df[col].fillna("").astype(str)
         df[col] = df[col].apply(fn)
-        changed = (df[col] != original.apply(lambda v: fn(v) if not pd.isna(v) else "")).sum()
-        # Simpler: count rows where value actually changed
-        original_str = original.fillna("").astype(str)
-        new_str = df[col].fillna("").astype(str)
-        change_counts[col] = int((original_str != new_str).sum())
+        change_counts[col] = int((df[col].fillna("").astype(str) != orig).sum())
+
+    # Flag junk rows (don't delete — let the user decide)
+    if "first_name" in df.columns and "last_name" in df.columns:
+        df["_junk_flag"] = df.apply(
+            lambda r: is_junk_name(str(r["first_name"]), str(r["last_name"])),
+            axis=1,
+        )
 
     return df, change_counts

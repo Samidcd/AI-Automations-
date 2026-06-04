@@ -220,15 +220,44 @@ else:
             })
             st.dataframe(diff_df, use_container_width=True)
 
+    # ── Junk row review ────────────────────────────────────────────────────────
+    if "_junk_flag" in cleaned.columns:
+        junk = cleaned[cleaned["_junk_flag"] == True].drop(columns=["_junk_flag"])
+        good = cleaned[cleaned["_junk_flag"] != True].drop(columns=["_junk_flag"])
+        if len(junk) > 0:
+            with st.expander(f"⚠️ {len(junk)} suspected junk / company rows — review before export", expanded=True):
+                st.caption(
+                    "These rows were flagged because the name looks like a company account, "
+                    "contains non-Latin characters, or is a single letter. "
+                    "They are excluded from the export below — download separately if needed."
+                )
+                st.dataframe(junk, use_container_width=True)
+                junk_csv = junk.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "⬇️ Download flagged rows",
+                    data=junk_csv,
+                    file_name="flagged_rows.csv",
+                    mime="text/csv",
+                )
+            cleaned = good  # exclude junk from main export
+        else:
+            st.success("No junk rows detected.")
+    else:
+        good = cleaned
+
     st.divider()
     st.markdown("**Full cleaned dataset:**")
-    st.dataframe(cleaned.head(50), use_container_width=True)
+    display_df = cleaned.drop(columns=["_junk_flag"], errors="ignore")
+    st.dataframe(display_df.head(50), use_container_width=True)
 
     st.divider()
     st.markdown("**Download:**")
     dl1, dl2 = st.columns(2)
 
-    csv_bytes = cleaned.to_csv(index=False).encode("utf-8")
+    export_df = cleaned.drop(columns=["_junk_flag"], errors="ignore")
+
+    # utf-8-sig = UTF-8 with BOM — Excel renders accented chars (é ü ñ) correctly
+    csv_bytes = export_df.to_csv(index=False).encode("utf-8-sig")
     dl1.download_button(
         "⬇️ Download CSV",
         data=csv_bytes,
@@ -239,7 +268,7 @@ else:
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        cleaned.to_excel(writer, index=False, sheet_name="Cleaned")
+        export_df.to_excel(writer, index=False, sheet_name="Cleaned")
     dl2.download_button(
         "⬇️ Download Excel",
         data=buf.getvalue(),
