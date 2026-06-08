@@ -522,7 +522,7 @@ def _sweep_honorifics(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     for col in df.columns:
         if col.lower() in _NO_HONORIFIC_COLS:
             continue
-        if df[col].dtype != object:
+        if not (df[col].dtype == object or pd.api.types.is_string_dtype(df[col])):
             continue
         orig = df[col].copy()
         df[col] = df[col].apply(
@@ -533,22 +533,19 @@ def _sweep_honorifics(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 
 
 def _sweep_quotes(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    “””
-    Remove single (‘) and double (“) quote characters from every column,
-    including phone and numeric fields.
-    Also strips smart/curly quote variants: ‘ ‘ “ “
-    Returns (df, total_cells_changed).
-    “””
-    QUOTES = re.compile(r”””[‘”’’’‚‛””„‟′″]”””)
+    # Remove straight and smart/curly quotes from every column.
+    # All quote chars as Unicode escapes - zero curly bytes in this source file.
+    _cps = [0x27,0x22,0x2018,0x2019,0x201a,0x201b,0x201c,0x201d,0x201e,0x201f,0x2032,0x2033]
+    _QUOTE_PAT = re.compile('[' + ''.join(chr(c) for c in _cps) + ']')
     changed = 0
     for col in df.columns:
-        if df[col].dtype != object:
+        if not (df[col].dtype == object or pd.api.types.is_string_dtype(df[col])):
             continue
-        orig = df[col].copy()
+        orig = df[col].astype(str).copy()
         df[col] = df[col].apply(
-            lambda v: QUOTES.sub(“”, str(v)) if pd.notna(v) else v
+            lambda v: _QUOTE_PAT.sub('', str(v)) if pd.notna(v) else v
         )
-        changed += int((df[col].fillna(“”) != orig.fillna(“”)).sum())
+        changed += int((df[col].astype(str).fillna('') != orig.fillna('')).sum())
     return df, changed
 
 
