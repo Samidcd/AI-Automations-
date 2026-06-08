@@ -65,7 +65,7 @@ st.markdown(
     <span class="rule-badge">Company — no extra hyphens or emojis</span>
     <span class="rule-badge">Location → Country (e.g. Boston, MA → United States)</span>
     <span class="rule-badge">Phone → +[digits] only, no dashes/brackets/spaces</span>
-    <span class="rule-badge">All columns — single quotes removed</span>
+    <span class="rule-badge">All columns — single &amp; double quotes removed (' " ' ' " ")</span>
     <span class="rule-badge">All text columns — honorifics swept out</span>
     </div>
     """,
@@ -179,7 +179,7 @@ else:
         # Change summary
         if changes:
             LABEL_MAP = {
-                "_global_single_quotes": "Single-quote removal (all cols)",
+                "_global_quotes":        "Quote removal ' \" (all cols)",
                 "_global_honorifics":    "Honorific sweep (all cols)",
             }
             st.markdown("**Changes by column:**")
