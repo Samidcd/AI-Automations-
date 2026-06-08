@@ -536,24 +536,22 @@ def _sweep_honorifics(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 
 
 def _sweep_quotes(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """
-    Remove single (') and double (") quote characters from every text column
-    that isn't a numeric/phone/ID field.
-    Also strips smart/curly quote variants: ' ' " "
+    “””
+    Remove single (‘) and double (“) quote characters from every column,
+    including phone and numeric fields.
+    Also strips smart/curly quote variants: ‘ ‘ “ “
     Returns (df, total_cells_changed).
-    """
-    QUOTES = re.compile(r"""['"'‘’‚‛“”„‟′″]""")
+    “””
+    QUOTES = re.compile(r”””[‘”’’’‚‛””„‟′″]”””)
     changed = 0
     for col in df.columns:
-        if col.lower() in _NUMERIC_ID_COLS:
-            continue
         if df[col].dtype != object:
             continue
         orig = df[col].copy()
         df[col] = df[col].apply(
-            lambda v: QUOTES.sub("", str(v)) if pd.notna(v) else v
+            lambda v: QUOTES.sub(“”, str(v)) if pd.notna(v) else v
         )
-        changed += int((df[col].fillna("") != orig.fillna("")).sum())
+        changed += int((df[col].fillna(“”) != orig.fillna(“”)).sum())
     return df, changed
 
 
