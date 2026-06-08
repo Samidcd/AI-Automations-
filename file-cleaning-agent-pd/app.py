@@ -1,8 +1,13 @@
 """File Cleaning Agent PD — Streamlit UI."""
 
+import sys
+import os
 import io
 import pandas as pd
 import streamlit as st
+
+# Ensure the app's own directory is on the path when run from repo root
+sys.path.insert(0, os.path.dirname(__file__))
 
 from modules import cleaner, loader
 
