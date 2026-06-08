@@ -489,11 +489,8 @@ def clean_phone(val) -> str:
     if not digits:
         return ""
 
-    if has_plus:
-        return f"+{digits}"
-    else:
-        # No prefix found — return digits unchanged (don't guess country code)
-        return digits
+    # Always ensure a + prefix regardless of whether one was present originally
+    return f"+{digits}"
 
 
 # ── Global column sweeps ──────────────────────────────────────────────────────
