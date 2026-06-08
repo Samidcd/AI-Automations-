@@ -12,6 +12,9 @@ Pipeline (applied in order):
   8. Multi-word first-name resolution via LinkedIn slug
   9. First/Last swap detection via LinkedIn slug
  10. Junk-row detection (company accounts, non-Latin, single-letter)
+ 11. Single-quote removal across every column
+ 12. Honorific sweep across every text column (not just name fields)
+ 13. Phone number normalisation → +[digits], no dashes/brackets/spaces
 """
 
 import re
@@ -443,6 +446,113 @@ def clean_location(val) -> str:
     return text  # return cleaned original if unresolvable
 
 
+# ── Phone number normalisation ───────────────────────────────────────────────
+#
+# Rules:
+#   - Digits are NEVER altered — only formatting chars are removed
+#   - Output format: +[country-code][number]  e.g. +14155550123
+#   - Handles: +1 (415) 555-0123 / 0044 20 7946 0958 / (415) 555-0123
+#   - Leading 00 → + (international dialling prefix)
+#   - If no + or 00 prefix the digits are returned as-is (no country code injected)
+
+_PHONE_COLUMNS = {
+    "phone", "phone_number", "mobile", "mobile_number", "telephone",
+    "tel", "cell", "cell_phone", "work_phone", "direct_phone",
+    "phone 1", "phone 2", "phone1", "phone2",
+    "enriched phone number 1", "enriched phone number 2",
+    "enriched_phone_number_1", "enriched_phone_number_2",
+}
+
+
+def clean_phone(val) -> str:
+    if pd.isna(val) or str(val).strip() == "":
+        return ""
+    raw = str(val).strip()
+
+    # Remove single quotes, hidden chars, emojis first
+    raw = raw.replace("'", "")
+    raw = _strip_hidden(raw)
+    raw = _strip_emojis(raw)
+
+    # Detect leading + before we strip everything
+    has_plus = raw.lstrip().startswith("+")
+
+    # Replace leading international prefix 00 with +
+    no_prefix = re.sub(r"^\s*00", "+", raw)
+    if no_prefix != raw:
+        has_plus = True
+        raw = no_prefix
+
+    # Strip every non-digit character (keeps digits only)
+    digits = re.sub(r"\D", "", raw)
+
+    if not digits:
+        return ""
+
+    if has_plus:
+        return f"+{digits}"
+    else:
+        # No prefix found — return digits unchanged (don't guess country code)
+        return digits
+
+
+# ── Global column sweeps ──────────────────────────────────────────────────────
+
+# Columns that must NEVER have honorifics removed (they're not name/title fields)
+_NO_HONORIFIC_COLS = {
+    "linkedin_url", "company_domain", "email", "business_email",
+    "phone", "phone_number", "mobile", "website", "url",
+}
+
+# Columns that are purely numeric / identifiers — skip quote removal too
+_NUMERIC_ID_COLS = {
+    "phone", "phone_number", "mobile", "mobile_number", "telephone", "tel",
+    "cell", "cell_phone", "work_phone", "direct_phone",
+    "phone 1", "phone 2", "phone1", "phone2",
+    "enriched phone number 1", "enriched phone number 2",
+    "enriched_phone_number_1", "enriched_phone_number_2",
+    "zip", "zip_code", "postal_code", "id", "record_id",
+}
+
+
+def _sweep_honorifics(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """
+    Remove honorific prefixes from every text column that isn't a URL,
+    email, or numeric/phone field.
+    Returns (df, total_cells_changed).
+    """
+    changed = 0
+    for col in df.columns:
+        if col.lower() in _NO_HONORIFIC_COLS:
+            continue
+        if df[col].dtype != object:
+            continue
+        orig = df[col].copy()
+        df[col] = df[col].apply(
+            lambda v: _strip_honorifics(str(v)).strip() if pd.notna(v) and str(v).strip() else (v if pd.isna(v) else str(v))
+        )
+        changed += int((df[col].fillna("") != orig.fillna("")).sum())
+    return df, changed
+
+
+def _sweep_single_quotes(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """
+    Remove single-quote characters (') from every text column that isn't
+    a numeric/phone/ID field.
+    Returns (df, total_cells_changed).
+    """
+    changed = 0
+    for col in df.columns:
+        if col.lower() in _NUMERIC_ID_COLS:
+            continue
+        if df[col].dtype != object:
+            continue
+        orig = df[col].copy()
+        df[col] = df[col].str.replace("'", "", regex=False)
+        changed += int((df[col].fillna("") != orig.fillna("")).sum())
+    return df, changed
+
+
 # ── Column name normalisation ─────────────────────────────────────────────────
 
 COLUMN_MAP = {
@@ -454,15 +564,29 @@ COLUMN_MAP = {
     "company":"company","company name":"company","organization":"company","organisation":"company","employer":"company",
     "location":"location","country":"location","country/region":"location","region":"location",
     "city":"location","city, state":"location","city/state":"location","city, country":"location",
+    # phone variants → canonical "phone"
+    "phone":"phone","phone number":"phone","phone_number":"phone",
+    "mobile":"phone","mobile number":"phone","mobile_number":"phone",
+    "telephone":"phone","tel":"phone","cell":"phone","cell phone":"phone",
+    "work phone":"phone","direct phone":"phone",
+    "phone 1":"phone_1","phone 2":"phone_2",
+    "enriched phone number 1":"phone_1","enriched phone number 2":"phone_2",
+    "enriched_phone_number_1":"phone_1","enriched_phone_number_2":"phone_2",
 }
 
+# Columns that get the phone cleaner applied
+_PHONE_CANONICAL = {"phone", "phone_1", "phone_2"}
+
 FIELD_CLEANERS = {
-    "first_name":  None,   # handled specially (needs linkedin_url)
-    "last_name":   clean_last_name,
-    "job_title":   clean_job_title,
+    "first_name":   None,   # handled specially (needs linkedin_url)
+    "last_name":    clean_last_name,
+    "job_title":    clean_job_title,
     "linkedin_url": clean_linkedin_url,
-    "company":     clean_company_name,
-    "location":    clean_location,
+    "company":      clean_company_name,
+    "location":     clean_location,
+    "phone":        clean_phone,
+    "phone_1":      clean_phone,
+    "phone_2":      clean_phone,
 }
 
 
@@ -485,13 +609,25 @@ def clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
     df = normalize_columns(df.copy())
     change_counts: dict[str, int] = {}
 
-    # First pass: clean linkedin_url (needed for first_name resolution)
+    # ── Pass 0: global sweeps (all text columns) ──────────────────────────────
+
+    # Remove single quotes from every non-numeric column
+    df, sq_changes = _sweep_single_quotes(df)
+    if sq_changes:
+        change_counts["_global_single_quotes"] = sq_changes
+
+    # Remove honorifics from every text column that isn't a URL/email/phone
+    df, hon_changes = _sweep_honorifics(df)
+    if hon_changes:
+        change_counts["_global_honorifics"] = hon_changes
+
+    # ── Pass 1: LinkedIn URL (needed for first_name resolution) ───────────────
     if "linkedin_url" in df.columns:
         orig = df["linkedin_url"].fillna("").astype(str)
         df["linkedin_url"] = df["linkedin_url"].apply(clean_linkedin_url)
         change_counts["linkedin_url"] = int((df["linkedin_url"].fillna("").astype(str) != orig).sum())
 
-    # Clean first_name (pass linkedin_url for slug resolution)
+    # ── Pass 2: first_name (needs linkedin_url for slug resolution) ───────────
     if "first_name" in df.columns:
         orig = df["first_name"].fillna("").astype(str)
         linkedin_series = df.get("linkedin_url", pd.Series([""] * len(df)))
@@ -501,7 +637,7 @@ def clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
         ]
         change_counts["first_name"] = int((df["first_name"].fillna("").astype(str) != orig).sum())
 
-    # Clean remaining fields
+    # ── Pass 3: remaining named-column cleaners ───────────────────────────────
     for col, fn in FIELD_CLEANERS.items():
         if fn is None or col not in df.columns:
             continue
@@ -509,7 +645,17 @@ def clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
         df[col] = df[col].apply(fn)
         change_counts[col] = int((df[col].fillna("").astype(str) != orig).sum())
 
-    # Flag junk rows (don't delete — let the user decide)
+    # ── Pass 4: phone cleaner on any remaining phone-like columns ─────────────
+    for col in df.columns:
+        col_lower = col.lower().replace(" ", "_")
+        if col_lower in _PHONE_COLUMNS and col not in _PHONE_CANONICAL:
+            orig = df[col].fillna("").astype(str)
+            df[col] = df[col].apply(clean_phone)
+            n = int((df[col].fillna("").astype(str) != orig).sum())
+            if n:
+                change_counts[col] = n
+
+    # ── Flag junk rows (review panel — not auto-deleted) ─────────────────────
     if "first_name" in df.columns and "last_name" in df.columns:
         df["_junk_flag"] = df.apply(
             lambda r: is_junk_name(str(r["first_name"]), str(r["last_name"])),

@@ -59,11 +59,14 @@ st.markdown(
     """
     <div style="margin-bottom:1rem">
     <span class="rule-badge">First Name — first name only, no titles or credentials</span>
-    <span class="rule-badge">Last Name — no OG / ! / quotes / extras</span>
+    <span class="rule-badge">Last Name — no OG / ! / extras</span>
     <span class="rule-badge">Job Title — no emojis or junk chars</span>
     <span class="rule-badge">LinkedIn URL — normalized & intact</span>
     <span class="rule-badge">Company — no extra hyphens or emojis</span>
     <span class="rule-badge">Location → Country (e.g. Boston, MA → United States)</span>
+    <span class="rule-badge">Phone → +[digits] only, no dashes/brackets/spaces</span>
+    <span class="rule-badge">All columns — single quotes removed</span>
+    <span class="rule-badge">All text columns — honorifics swept out</span>
     </div>
     """,
     unsafe_allow_html=True,
@@ -175,11 +178,16 @@ else:
 
         # Change summary
         if changes:
+            LABEL_MAP = {
+                "_global_single_quotes": "Single-quote removal (all cols)",
+                "_global_honorifics":    "Honorific sweep (all cols)",
+            }
             st.markdown("**Changes by column:**")
-            cols = st.columns(min(len(changes), 4))
+            cols_ui = st.columns(min(len(changes), 4))
             for i, (col, count) in enumerate(changes.items()):
-                cols[i % len(cols)].markdown(
-                    f"<span class='change-pill'>`{col}` — {count} cells</span>",
+                label = LABEL_MAP.get(col, col)
+                cols_ui[i % len(cols_ui)].markdown(
+                    f"<span class='change-pill'>`{label}` — {count} cells</span>",
                     unsafe_allow_html=True,
                 )
 
